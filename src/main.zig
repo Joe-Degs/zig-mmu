@@ -31,7 +31,6 @@ fn MMU(
     return struct {
         mmu: [mem_size]u8 = undefined,
         perms: [mem_size]u8 = undefined,
-        cur_alloc: usize = base,
 
         pub const Self = @This();
 
@@ -77,16 +76,8 @@ fn MMU(
         }
 
         fn perm_is(self: *Self, addr: usize, size: usize, perm: Perm) bool {
-            for (addr..addr + size) |ii| {
-                if (debug) {
-                    std.debug.print("[perm_is({d})] -> start: {d} end: {d} perm: {any}\n", .{
-                        ii,
-                        addr,
-                        addr + size,
-                        self.perms[ii],
-                    });
-                }
-                if (self.perms[ii] & @enumToInt(perm) != @enumToInt(perm))
+            for (self.perms[addr .. addr + size]) |b| {
+                if (b & @enumToInt(perm) != @enumToInt(perm))
                     return false;
             }
             return true;
@@ -100,14 +91,16 @@ fn MMU(
             return self.mmu[addr .. addr + size];
         }
 
-        /// read from memory into `buf` checking the necessary permission. if the
-        /// if default permission checked is Perm.Read
-        fn read_into(self: *Self, addr: usize, buf: []u8, perm: ?Perm) Error!void {
+        /// read `size` bytes starting from `addr` into `buf`.
+        /// default permission is Perm.Read
+        pub fn read_into(self: *Self, addr: usize, buf: []u8, perm: ?Perm) Error!void {
             var mem = try self.get_alloc_region(addr, buf.len, perm);
             for (mem, buf) |b, *d| d.* = b;
         }
 
-        fn write_from(self: *Self, addr: usize, buf: []const u8, perm: ?Perm) Error!void {
+        // write `buf.len` bytes starting at `addr` into memory.
+        // defualt permission is Perm.Write
+        pub fn write_from(self: *Self, addr: usize, buf: []const u8, perm: ?Perm) Error!void {
             var mem = try self.get_alloc_region(addr, buf.len, perm orelse Perm.Write);
             for (mem, buf) |*b, d| b.* = d;
         }
@@ -148,4 +141,11 @@ test "alloc-write-read hello" {
     var buf = [_]u8{0} ** hello.len;
     try mmu.read_into(addr, &buf, null);
     try testing.expect(std.mem.eql(u8, &buf, "hello"));
+}
+
+test "alloc big" {
+    var mmu = (try MMU(0x100_000, 0x100)).init();
+    var addr = mmu.alloc(0xfff).?;
+    try testing.expect(std.mem.isValidAlign(addr));
+    std.debug.print("big addr: 0x{x}\n", .{addr});
 }
