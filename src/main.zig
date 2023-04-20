@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const testing = std.testing;
 
@@ -9,36 +10,49 @@ const Perm = enum(u8) {
     _,
 };
 
-const Error = error{ BadMemSize, BadAlignment, Permission };
+const Error = error{ BadMemSize, BadAlignment, Permission } || Allocator.Error;
 
 fn MMU(
     comptime mem_size: usize,
     comptime base: usize,
     // comptime dirty_sz: usize,
-) Error!type {
-    // _ = dirty_sz;
-
-    // memory size must be valid power of two so we can do bounds
-    // checking with
-    if (!std.mem.isValidAlign(mem_size))
-        return Error.BadMemSize;
-
-    // base alloc must have a 32-bit alignment base
-    assert(base != 0);
-    if (base & 0x3 != 0)
-        return Error.BadAlignment;
-
+) type {
     return struct {
-        mmu: [mem_size]u8 = undefined,
-        perms: [mem_size]u8 = undefined,
+        const Self = @This();
 
-        pub const Self = @This();
+        allocator: Allocator,
+        memory: []u8,
+        perms: []u8,
 
-        pub fn init() Self {
-            return .{
-                .mmu = std.mem.zeroes([mem_size]u8),
-                .perms = std.mem.zeroes([mem_size]u8),
+        pub fn init(allocator: Allocator) Error!Self {
+            // _ = dirty_sz;
+
+            // memory size must be valid power of two so we can do bounds
+            // checking with
+            if (!std.mem.isValidAlign(mem_size) or mem_size < 32)
+                return Error.BadMemSize;
+
+            // base alloc must have a 32-bit alignment base
+            assert(base != 0);
+            if (base & 0x3 != 0)
+                return Error.BadAlignment;
+
+            var self = Self{
+                .allocator = allocator,
+                .memory = try allocator.alloc(u8, mem_size),
+                .perms = try allocator.alloc(u8, mem_size),
             };
+
+            // discovered the hard way that heap allocated memory is not guaranteed
+            // to be zero-ed out (i want to move back to golang :-/)
+            for (self.perms) |*p| p.* = 0;
+
+            return self;
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.allocator.free(self.perms);
+            self.allocator.free(self.memory);
         }
 
         /// set permission on memory starting of `size` bytes starting at `addr`
@@ -56,10 +70,8 @@ fn MMU(
             // we step through memory looking for space
             var ii: usize = 16;
             while (ii < self.perms.len) : (ii += 16) {
-                if (ii + size > self.perms.len)
-                    return null;
+                if (ii + size > self.perms.len) return null;
 
-                // if permissions on memory are set we continue our search
                 if (std.mem.allEqual(u8, self.perms[ii .. ii + size], 0)) {
                     self.set_perms(base + ii, size, perm);
                     return ii;
@@ -72,7 +84,7 @@ fn MMU(
             return self.alloc_perms(
                 size,
                 @intToEnum(Perm, @enumToInt(Perm.Read) | @enumToInt(Perm.Write)),
-            ).?;
+            );
         }
 
         fn perm_is(self: *Self, addr: usize, size: usize, perm: Perm) bool {
@@ -88,7 +100,7 @@ fn MMU(
         fn get_alloc_region(self: *Self, addr: usize, size: usize, perm: ?Perm) Error![]u8 {
             if (!self.perm_is(addr, size, perm orelse Perm.Read))
                 return Error.Permission;
-            return self.mmu[addr .. addr + size];
+            return self.memory[addr .. addr + size];
         }
 
         /// read `size` bytes starting from `addr` into `buf`.
@@ -109,18 +121,30 @@ fn MMU(
 
 const debug = false;
 
-test "mem_size alignment/initial alloc" {
-    try testing.expectError(Error.BadMemSize, MMU(0, 0));
-    try testing.expectError(Error.BadMemSize, MMU(10, 16));
-    try testing.expectError(Error.BadMemSize, MMU(0, 16));
-    try testing.expectError(Error.BadAlignment, MMU(16, 10));
+test "memory size and alignment" {
+    const allocator = testing.allocator;
+    try testing.expectError(Error.BadMemSize, MMU(0, 0).init(allocator));
+    try testing.expectError(Error.BadMemSize, MMU(10, 16).init(allocator));
+    try testing.expectError(Error.BadMemSize, MMU(0, 16).init(allocator));
+    try testing.expectError(Error.BadAlignment, MMU(64, 10).init(allocator));
+}
 
-    var mmu = (try MMU(64, 16)).init();
+test "allocate and write to memory" {
+    // var some_buf = try testing.allocator.alloc(u8, 2);
+    // defer testing.allocator.free(some_buf);
+    // std.debug.print("before write: {any}\n", .{some_buf});
+    // for (some_buf) |*b| b.* = 2;
+    // std.debug.print("after write: {any}\n", .{some_buf});
+
+    var mmu = try MMU(64, 16).init(testing.allocator);
+    defer mmu.deinit();
+    try testing.expect(mmu.alloc(0xff) == null);
+
     const hello = "hello";
-    var addr = mmu.alloc(hello.len).?;
+    var addr = mmu.alloc(hello.len) orelse unreachable;
     try testing.expect(std.mem.isValidAlign(addr));
 
-    var addr2 = mmu.alloc(24).?;
+    var addr2 = mmu.alloc(24) orelse unreachable;
     try testing.expect(std.mem.isValidAlign(addr2));
 
     std.debug.print("addr1: {x}, addr2: {x}\n", .{ addr, addr2 });
@@ -129,10 +153,12 @@ test "mem_size alignment/initial alloc" {
     try testing.expectEqual(region.len, hello.len);
 }
 
-test "alloc-write-read hello" {
-    var mmu = (try MMU(64, 16)).init();
+test "allocate, write and read memory" {
+    const allocator = testing.allocator;
+    var mmu = try MMU(64, 16).init(allocator);
+    defer mmu.deinit();
     const hello = "hello";
-    var addr = mmu.alloc(hello.len).?;
+    var addr = mmu.alloc(hello.len) orelse unreachable;
     try mmu.write_from(addr, hello[0..], null);
 
     var region = try mmu.get_alloc_region(addr, hello.len, null);
@@ -144,8 +170,11 @@ test "alloc-write-read hello" {
 }
 
 test "alloc big" {
-    var mmu = (try MMU(0x100_000, 0x100)).init();
-    var addr = mmu.alloc(0xfff).?;
+    const allocator = testing.allocator;
+    var mmu = try MMU(0x100_000, 0x100).init(allocator);
+    defer mmu.deinit();
+    var addr = mmu.alloc(0xfff) orelse unreachable;
+    var addr2 = mmu.alloc(0x100) orelse unreachable;
     try testing.expect(std.mem.isValidAlign(addr));
-    std.debug.print("big addr: 0x{x}\n", .{addr});
+    std.debug.print("addr1: 0x{x}, addr2: 0x{x}\n", .{ addr, addr2 });
 }
