@@ -1,5 +1,6 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
+const mem = std.mem;
+const Allocator = mem.Allocator;
 const assert = std.debug.assert;
 const testing = std.testing;
 
@@ -63,6 +64,7 @@ fn MMU(
             for (self.perms[start .. start + size]) |*b| b.* = @enumToInt(perm);
         }
 
+        // allocate memory and set specified permission byte `perm` on it
         pub fn alloc_perms(self: *Self, size: usize, perm: Perm) ?usize {
             if (debug)
                 std.debug.print("[alloc_perms] size: {d} perm: {any}\n", .{ size, perm });
@@ -80,6 +82,7 @@ fn MMU(
             return null;
         }
 
+        // allocate read-write memory of `size`
         pub fn alloc(self: *Self, size: usize) ?usize {
             return self.alloc_perms(
                 size,
@@ -87,7 +90,8 @@ fn MMU(
             );
         }
 
-        fn perm_is(self: *Self, addr: usize, size: usize, perm: Perm) bool {
+        // check if memory of `size` bytes starting at `addr` is set to `perm`
+        fn perm_is(self: Self, addr: usize, size: usize, perm: Perm) bool {
             for (self.perms[addr .. addr + size]) |b| {
                 if (b & @enumToInt(perm) != @enumToInt(perm))
                     return false;
@@ -95,9 +99,10 @@ fn MMU(
             return true;
         }
 
-        /// NSFW
+        /// NSFW: memory returned is owned by MMU object.
+        ///
         /// return a slice of `size` bytes of allocated memory starting at `addr`
-        fn get_alloc_region(self: *Self, addr: usize, size: usize, perm: ?Perm) Error![]u8 {
+        fn get_alloc_region(self: Self, addr: usize, size: usize, perm: ?Perm) Error![]u8 {
             if (!self.perm_is(addr, size, perm orelse Perm.Read))
                 return Error.Permission;
             return self.memory[addr .. addr + size];
@@ -106,15 +111,30 @@ fn MMU(
         /// read `size` bytes starting from `addr` into `buf`.
         /// default permission is Perm.Read
         pub fn read_into(self: *Self, addr: usize, buf: []u8, perm: ?Perm) Error!void {
-            var mem = try self.get_alloc_region(addr, buf.len, perm);
-            for (mem, buf) |b, *d| d.* = b;
+            const bytes = try self.get_alloc_region(addr, buf.len, perm);
+            for (bytes, buf) |b, *d| d.* = b;
         }
 
         // write `buf.len` bytes starting at `addr` into memory.
         // defualt permission is Perm.Write
         pub fn write_from(self: *Self, addr: usize, buf: []const u8, perm: ?Perm) Error!void {
-            var mem = try self.get_alloc_region(addr, buf.len, perm orelse Perm.Write);
-            for (mem, buf) |*b, d| b.* = d;
+            const bytes = try self.get_alloc_region(addr, buf.len, perm orelse Perm.Write);
+            for (bytes, buf) |*b, d| b.* = d;
+        }
+
+        // write primitive integer `val` into memory starting at addr
+        pub fn write_from_val(self: *Self, comptime T: type, addr: usize, val: T) Error!void {
+            const bytes = mem.toBytes(mem.nativeToLittle(T, val));
+            return self.write_from(addr, bytes[0..], null);
+        }
+
+        // read from memory into a primitive integer type
+        pub fn read_into_val(self: Self, comptime T: type, addr: usize) Error!T {
+            var bytes = try self.get_alloc_region(addr, @sizeOf(T), Perm.Read);
+            return mem.littleToNative(
+                T,
+                mem.bytesToValue(T, @ptrCast(*[@sizeOf(T)]u8, bytes.ptr)),
+            );
         }
     };
 }
@@ -127,6 +147,13 @@ test "memory size and alignment" {
     try testing.expectError(Error.BadMemSize, MMU(10, 16).init(allocator));
     try testing.expectError(Error.BadMemSize, MMU(0, 16).init(allocator));
     try testing.expectError(Error.BadAlignment, MMU(64, 10).init(allocator));
+
+    var mmu = try MMU(0x100_000, 0x100).init(allocator);
+    defer mmu.deinit();
+    var addr = mmu.alloc(0xfff) orelse unreachable;
+    var addr2 = mmu.alloc(0x100) orelse unreachable;
+    try testing.expect(std.mem.isValidAlign(addr));
+    std.debug.print("addr1: 0x{x}, addr2: 0x{x}\n", .{ addr, addr2 });
 }
 
 test "allocate and write to memory" {
@@ -169,12 +196,28 @@ test "allocate, write and read memory" {
     try testing.expect(std.mem.eql(u8, &buf, "hello"));
 }
 
-test "alloc big" {
-    const allocator = testing.allocator;
-    var mmu = try MMU(0x100_000, 0x100).init(allocator);
+test "read and write primitive ints" {
+    var mmu = try MMU(0x1000, 0x10).init(testing.allocator);
     defer mmu.deinit();
-    var addr = mmu.alloc(0xfff) orelse unreachable;
-    var addr2 = mmu.alloc(0x100) orelse unreachable;
-    try testing.expect(std.mem.isValidAlign(addr));
-    std.debug.print("addr1: 0x{x}, addr2: 0x{x}\n", .{ addr, addr2 });
+
+    const num: u32 = 10;
+    const num_type = @TypeOf(num);
+    var num_addr = mmu.alloc(@sizeOf(num_type)) orelse unreachable;
+    try mmu.write_from_val(num_type, num_addr, num);
+    try testing.expect(try mmu.read_into_val(num_type, num_addr) == num);
+
+    const list_type = i64;
+    const numbers = [_]list_type{ -1, 444, 4445, 0x1000, 0xdeadbeef, -11283737 };
+    const list_size = @sizeOf(list_type) * numbers.len;
+    const list_addr = mmu.alloc(list_size) orelse unreachable;
+
+    for (numbers, 0..) |elem, ii| {
+        const addr = list_addr + @sizeOf(list_type) * ii;
+        try mmu.write_from_val(list_type, addr, elem);
+    }
+
+    for (numbers, 0..) |elem, ii| {
+        const addr = list_addr + @sizeOf(list_type) * ii;
+        try testing.expect(try mmu.read_into_val(list_type, addr) == elem);
+    }
 }
